@@ -304,6 +304,254 @@ def solve_challenge(challenge):
 
 # ─── Commands ───
 
+def cmd_tweet(args):
+    """Step 1: Post verification tweet only."""
+    config = load_config()
+    if not config:
+        log("❌ No config. Run 'register' first."); return
+
+    auth_token = args.auth_token
+    tweet_text = config.get("tweet_template", "")
+
+    if not tweet_text:
+        log("❌ No tweet template in config. Re-run 'register'."); return
+
+    # Create Twitter session
+    log("Setting up Twitter session...")
+    session, ct0 = twitter_session(auth_token)
+    if not ct0:
+        log("❌ Failed to get Twitter CSRF token. Check auth_token."); return
+    log("  ✅ Twitter session ready")
+
+    # Post verification tweet
+    log("Posting verification tweet...")
+    ok, result = post_tweet(session, ct0, tweet_text)
+    if not ok:
+        log(f"❌ Tweet failed: {result}"); return
+
+    log(f"  ✅ Tweet posted: https://x.com/i/status/{result}")
+    log("")
+    log("Next step: Run OAuth verification")
+    log(f"  python3 {sys.argv[0]} verify --auth-token YOUR_TOKEN")
+
+def get_oauth_url_from_moltbook(session, claim_url):
+    """
+    Get OAuth URL from Moltbook using NextAuth flow.
+    1. Get CSRF token from /api/auth/session
+    2. Use CSRF token to call /api/auth/signin/twitter
+    """
+    try:
+        # Step 1: Get CSRF token
+        log("  Getting CSRF token...")
+        session_resp = session.get(
+            "https://www.moltbook.com/api/auth/session",
+            headers={
+                "Referer": claim_url,
+                "Accept": "*/*",
+            },
+            timeout=10
+        )
+
+        # Extract CSRF token from cookies
+        csrf_token = None
+
+        # Try to get cookie directly
+        csrf_cookie = session.cookies.get("__Host-authjs.csrf-token")
+        if csrf_cookie:
+            # Format: token%7Chash or token|hash
+            csrf_token = csrf_cookie.split("%7C")[0] if "%7C" in csrf_cookie else csrf_cookie.split("|")[0]
+
+        # If not found, try parsing from Set-Cookie header
+        if not csrf_token and "Set-Cookie" in session_resp.headers:
+            set_cookie = session_resp.headers.get("Set-Cookie", "")
+            if "__Host-authjs.csrf-token=" in set_cookie:
+                # Extract: __Host-authjs.csrf-token=TOKEN%7CHASH; ...
+                cookie_part = set_cookie.split("__Host-authjs.csrf-token=")[1].split(";")[0]
+                csrf_token = cookie_part.split("%7C")[0] if "%7C" in cookie_part else cookie_part.split("|")[0]
+
+        if not csrf_token:
+            log("  ❌ Could not get CSRF token")
+            return None
+
+        log("  ✅ Got CSRF token")
+
+        # Step 2: Call signin endpoint with CSRF token
+        log("  Requesting OAuth URL...")
+
+        # Prepare callback URL
+        callback_url = claim_url.replace("https://www.moltbook.com", "")
+        if "?" not in callback_url:
+            callback_url += "?x_connected=true"
+
+        signin_resp = session.post(
+            "https://www.moltbook.com/api/auth/signin/twitter",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": claim_url,
+                "Origin": "https://www.moltbook.com",
+                "X-Auth-Return-Redirect": "1",
+                "Accept": "*/*",
+            },
+            data={
+                "csrfToken": csrf_token,
+                "callbackUrl": callback_url,
+            },
+            allow_redirects=False,
+            timeout=10
+        )
+
+        # Check for redirect to Twitter OAuth
+        if signin_resp.status_code in (301, 302, 303, 307):
+            location = signin_resp.headers.get("Location", "")
+            if "twitter.com" in location or "x.com" in location:
+                log("  ✅ Got OAuth URL")
+                return location
+
+        # Try to parse JSON response
+        try:
+            data = signin_resp.json()
+            if "url" in data:
+                oauth_url = data["url"]
+                if "twitter.com" in oauth_url or "x.com" in oauth_url:
+                    log("  ✅ Got OAuth URL from JSON")
+                    return oauth_url
+        except:
+            pass
+
+        log(f"  ❌ Unexpected response: {signin_resp.status_code}")
+        return None
+
+    except Exception as e:
+        log(f"  ❌ Error: {e}")
+        return None
+
+def twitter_oauth2_authorize(session, oauth_url):
+    """
+    Automate Twitter OAuth 2.0 authorization.
+    1. Visit the OAuth URL (user should already be logged in via auth_token)
+    2. Click authorize button
+    3. Follow redirect back to Moltbook
+    """
+    log("  Visiting OAuth page...")
+
+    try:
+        # Visit OAuth page
+        resp = session.get(oauth_url, timeout=15, allow_redirects=True)
+
+        # Check if we're on the authorization page
+        if "oauth2/authorize" not in resp.url:
+            # Maybe already authorized or redirected
+            if "moltbook.com" in resp.url:
+                log("  Already authorized, redirected to Moltbook")
+                return True, resp.url
+            return False, f"Unexpected redirect: {resp.url}"
+
+        html = resp.text
+
+        # Look for the authorize form
+        # OAuth 2.0 uses a form with authenticity_token
+        auth_match = re.search(r'name="authenticity_token"\s+value="([^"]+)"', html)
+        if not auth_match:
+            # Maybe already authorized
+            if "moltbook.com" in resp.url:
+                return True, resp.url
+            return False, "Could not find authenticity_token"
+
+        authenticity_token = auth_match.group(1)
+
+        log("  Authorizing app...")
+
+        # Submit authorization form
+        auth_data = {
+            "authenticity_token": authenticity_token,
+            "approval": "true",
+        }
+
+        auth_resp = session.post(
+            resp.url,
+            data=auth_data,
+            timeout=15,
+            allow_redirects=True,
+        )
+
+        # Should be redirected back to Moltbook
+        if "moltbook.com" in auth_resp.url:
+            log("  ✅ Authorization successful")
+            return True, auth_resp.url
+
+        return False, f"Authorization failed, ended at: {auth_resp.url}"
+
+    except Exception as e:
+        return False, f"OAuth error: {e}"
+
+def cmd_verify(args):
+    """Step 2: Complete OAuth verification (assumes tweet already posted)."""
+    config = load_config()
+    if not config:
+        log("❌ No config. Run 'register' first."); return
+
+    auth_token = args.auth_token
+    api_key = config["api_key"]
+    claim_url = config.get("claim_url", "")
+
+    # Check if already claimed
+    if api_get("agents/status", api_key).get("status") == "claimed":
+        log("✅ Already claimed!"); return
+
+    # Create Twitter session with curl_cffi
+    log("Setting up Twitter session...")
+    session, ct0 = twitter_session(auth_token)
+    if not ct0:
+        log("❌ Failed to get Twitter CSRF token. Check auth_token."); return
+    log("  ✅ Twitter session ready")
+
+    # Get OAuth URL from Moltbook
+    log("Getting OAuth URL from Moltbook...")
+    oauth_url = get_oauth_url_from_moltbook(session, claim_url)
+
+    if not oauth_url:
+        log("❌ Could not get OAuth URL")
+        log("   Falling back to manual mode...")
+        log(f"   Open: {claim_url}")
+        log("   Complete the OAuth flow in your browser")
+        log("")
+        log("⏳ Waiting for verification...")
+
+        for i in range(120):
+            time.sleep(10)
+            status = api_get("agents/status", api_key).get("status")
+            if status == "claimed":
+                log("✅ Agent claimed successfully!")
+                log(f"   Start minting: python3 {sys.argv[0]} mint --loop")
+                return
+            if i % 6 == 0 and i > 0:
+                log(f"  Still waiting... ({(i*10)//60} min)")
+
+        log("⏳ Timeout")
+        return
+
+    # Authorize via OAuth 2.0
+    log("Authorizing via Twitter OAuth 2.0...")
+    ok, result = twitter_oauth2_authorize(session, oauth_url)
+
+    if not ok:
+        log(f"❌ OAuth failed: {result}")
+        return
+
+    # Check status
+    log("Verifying claim...")
+    time.sleep(3)
+    for i in range(10):
+        status = api_get("agents/status", api_key).get("status")
+        if status == "claimed":
+            log("✅ Agent claimed successfully!")
+            log(f"   Start minting: python3 {sys.argv[0]} mint --loop")
+            return
+        time.sleep(3)
+
+    log("⏳ Claim pending. Check status:")
+    log(f"   python3 {sys.argv[0]} status")
+
 def cmd_register(args):
     name, desc = args.name, args.desc or f"AI agent {name}"
     log(f"Registering agent: {name}")
@@ -510,20 +758,26 @@ def main():
     r = sub.add_parser("register", help="Register agent")
     r.add_argument("--name", required=True)
     r.add_argument("--desc", default=None)
-    
-    c = sub.add_parser("claim", help="Auto-claim via Twitter")
+
+    t = sub.add_parser("tweet", help="Step 1: Post verification tweet")
+    t.add_argument("--auth-token", required=True, help="Twitter auth_token cookie")
+
+    v = sub.add_parser("verify", help="Step 2: Complete OAuth verification")
+    v.add_argument("--auth-token", required=True, help="Twitter auth_token cookie")
+
+    c = sub.add_parser("claim", help="Complete flow: tweet + OAuth (all-in-one)")
     c.add_argument("--auth-token", required=True, help="Twitter auth_token cookie")
-    
+
     sub.add_parser("status", help="Check status")
-    
+
     m = sub.add_parser("mint", help="Mint tokens")
     m.add_argument("--tick", default="CLAW")
     m.add_argument("--amt", default="1000")
     m.add_argument("--loop", action="store_true")
     m.add_argument("--interval", type=int, default=7200)
-    
+
     args = p.parse_args()
-    {"register": cmd_register, "claim": cmd_claim, "status": cmd_status, "mint": cmd_mint}.get(args.cmd, lambda _: p.print_help())(args)
+    {"register": cmd_register, "tweet": cmd_tweet, "verify": cmd_verify, "claim": cmd_claim, "status": cmd_status, "mint": cmd_mint}.get(args.cmd, lambda _: p.print_help())(args)
 
 if __name__ == "__main__":
     main()
