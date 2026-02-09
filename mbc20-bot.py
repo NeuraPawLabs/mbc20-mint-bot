@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MBC-20 Complete Mint Bot
-Full automation: register → tweet verify → claim → auto-mint
+Full automation: register → tweet → OAuth claim → auto-mint
 
 Usage:
   python3 mbc20-bot.py register --name MyAgent
@@ -22,17 +22,14 @@ import argparse
 import random
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode
 
 BASE_URL = "https://www.moltbook.com/api/v1"
 CONFIG_DIR = Path.home() / ".config" / "moltbook"
 CONFIG_FILE = CONFIG_DIR / "credentials.json"
 
-# ─── Twitter Constants ───
-
 TWITTER_BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 TWITTER_CREATE_TWEET_URL = "https://x.com/i/api/graphql/mnCM2YNMkpMB5bYEbGGKRQ/CreateTweet"
-
-# ─── Word-to-Number ───
 
 WORD_NUMS = {
     'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4,
@@ -61,59 +58,43 @@ def save_config(data):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(data, f, indent=2)
     os.chmod(CONFIG_FILE, 0o600)
-    log(f"Config saved to {CONFIG_FILE}")
 
 def get_headers(api_key):
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 def api_post(path, data, api_key=None):
     headers = get_headers(api_key) if api_key else {"Content-Type": "application/json"}
     try:
-        resp = requests.post(f"{BASE_URL}/{path}", headers=headers, json=data, timeout=30)
-        return resp.json()
+        return requests.post(f"{BASE_URL}/{path}", headers=headers, json=data, timeout=30).json()
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 def api_get(path, api_key):
     try:
-        resp = requests.get(f"{BASE_URL}/{path}", headers=get_headers(api_key), timeout=30)
-        return resp.json()
+        return requests.get(f"{BASE_URL}/{path}", headers=get_headers(api_key), timeout=30).json()
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ─── Twitter API ───
+# ─── Twitter ───
 
-def get_twitter_ct0(auth_token):
-    """Get ct0 CSRF token from Twitter using auth_token cookie."""
-    session = requests.Session()
-    session.cookies.set("auth_token", auth_token, domain=".x.com")
-    
+def twitter_session(auth_token):
+    """Create a Twitter session with auth_token and get ct0."""
+    s = requests.Session()
+    s.cookies.set("auth_token", auth_token, domain=".x.com")
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    # Get ct0
     try:
-        resp = session.get("https://x.com/home", timeout=15, allow_redirects=True)
-        ct0 = session.cookies.get("ct0", domain=".x.com")
-        if ct0:
-            return ct0, session
-        
-        # Try extracting from response
-        for cookie in session.cookies:
-            if cookie.name == "ct0":
-                return cookie.value, session
-    except Exception as e:
-        log(f"  Failed to get ct0: {e}")
-    
-    return None, session
+        s.get("https://x.com/home", timeout=15, allow_redirects=True)
+    except:
+        pass
+    ct0 = s.cookies.get("ct0", domain=".x.com")
+    return s, ct0
 
-def post_tweet(auth_token, text):
-    """Post a tweet using Twitter auth_token."""
-    log(f"  Posting tweet...")
-    
-    ct0, session = get_twitter_ct0(auth_token)
-    if not ct0:
-        return False, "Failed to get CSRF token (ct0). Check your auth_token."
-    
+def post_tweet(session, ct0, text):
+    """Post a tweet."""
     headers = {
         "Authorization": f"Bearer {TWITTER_BEARER}",
         "Content-Type": "application/json",
@@ -124,7 +105,6 @@ def post_tweet(auth_token, text):
         "Referer": "https://x.com/compose/tweet",
         "Origin": "https://x.com",
     }
-    
     payload = {
         "variables": {
             "tweet_text": text,
@@ -159,357 +139,370 @@ def post_tweet(auth_token, text):
         },
         "queryId": "mnCM2YNMkpMB5bYEbGGKRQ",
     }
-    
-    session.cookies.set("ct0", ct0, domain=".x.com")
-    
     try:
-        resp = session.post(
-            TWITTER_CREATE_TWEET_URL,
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
+        resp = session.post(TWITTER_CREATE_TWEET_URL, headers=headers, json=payload, timeout=30)
         data = resp.json()
-        
-        tweet_result = data.get("data", {}).get("create_tweet", {}).get("tweet_results", {}).get("result", {})
-        tweet_id = tweet_result.get("rest_id")
-        
+        tweet_id = data.get("data", {}).get("create_tweet", {}).get("tweet_results", {}).get("result", {}).get("rest_id")
         if tweet_id:
-            log(f"  ✅ Tweet posted: https://x.com/i/status/{tweet_id}")
             return True, tweet_id
-        
-        # Check for errors
         errors = data.get("errors", [])
         if errors:
             return False, errors[0].get("message", str(errors))
-        
-        return False, f"Unexpected response: {json.dumps(data)[:200]}"
-        
+        return False, f"Unexpected: {json.dumps(data)[:200]}"
     except Exception as e:
         return False, str(e)
+
+def twitter_oauth_authorize(session, ct0, oauth_url):
+    """
+    Automate Twitter OAuth authorization.
+    1. GET the OAuth authorize page
+    2. Extract authenticity_token and oauth_token
+    3. POST to authorize (approve the app)
+    4. Return the callback URL with oauth_verifier
+    """
+    log("  Fetching OAuth authorize page...")
+    
+    try:
+        resp = session.get(oauth_url, timeout=15, allow_redirects=True)
+    except Exception as e:
+        return False, f"Failed to load OAuth page: {e}"
+    
+    # Check if we got redirected to login
+    if "/login" in resp.url or "oauth" not in resp.url:
+        return False, f"Redirected to login. auth_token may be invalid. URL: {resp.url}"
+    
+    html = resp.text
+    
+    # Extract authenticity_token
+    auth_match = re.search(r'name="authenticity_token"\s+value="([^"]+)"', html)
+    if not auth_match:
+        # Maybe already authorized, check for callback redirect
+        if "oauth_verifier" in resp.url:
+            return True, resp.url
+        return False, "Could not find authenticity_token in OAuth page"
+    
+    authenticity_token = auth_match.group(1)
+    
+    # Extract oauth_token
+    oauth_match = re.search(r'name="oauth_token"\s+value="([^"]+)"', html)
+    if not oauth_match:
+        oauth_match = re.search(r'oauth_token=([^&"]+)', resp.url)
+    
+    if not oauth_match:
+        return False, "Could not find oauth_token"
+    
+    oauth_token = oauth_match.group(1)
+    
+    log("  Authorizing app...")
+    
+    # POST to authorize
+    authorize_data = {
+        "authenticity_token": authenticity_token,
+        "redirect_after_login": resp.url,
+        "oauth_token": oauth_token,
+    }
+    
+    try:
+        auth_resp = session.post(
+            "https://api.x.com/oauth/authorize",
+            data=authorize_data,
+            timeout=15,
+            allow_redirects=False,
+        )
+    except Exception as e:
+        return False, f"OAuth authorize POST failed: {e}"
+    
+    # Should get a redirect to the callback URL
+    if auth_resp.status_code in (301, 302, 303, 307):
+        callback_url = auth_resp.headers.get("Location", "")
+        if "oauth_verifier" in callback_url or "moltbook" in callback_url:
+            return True, callback_url
+        return False, f"Unexpected redirect: {callback_url}"
+    
+    # Check response body for redirect
+    redirect_match = re.search(r'href="([^"]*oauth_verifier[^"]*)"', auth_resp.text)
+    if redirect_match:
+        return True, redirect_match.group(1)
+    
+    # Maybe the response itself contains the callback
+    if "oauth_verifier" in auth_resp.text:
+        url_match = re.search(r'(https?://[^\s"<>]*oauth_verifier=[^\s"<>]*)', auth_resp.text)
+        if url_match:
+            return True, url_match.group(1)
+    
+    return False, f"OAuth authorize returned {auth_resp.status_code}, no redirect found"
 
 # ─── Challenge Solver ───
 
 def clean_challenge(text):
-    cleaned = re.sub(r'[^a-zA-Z0-9 .,?]', ' ', text)
-    return re.sub(r'\s+', ' ', cleaned).lower().strip()
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-zA-Z0-9 .,?]', ' ', text)).lower().strip()
 
 def words_to_number(words):
-    result = 0
     current = 0
     for w in words:
-        if w not in WORD_NUMS:
-            break
+        if w not in WORD_NUMS: break
         val = WORD_NUMS[w]
-        if val >= 100:
-            current = (current or 1) * val
-        else:
-            current += val
-    return result + current
+        current = ((current or 1) * val) if val >= 100 else (current + val)
+    return current
 
 def extract_numbers(text):
-    numbers = []
-    words = text.split()
-    i = 0
+    numbers, words, i = [], text.split(), 0
     while i < len(words):
         w = words[i].strip('.,?!')
         if re.match(r'^\d+\.?\d*$', w):
-            numbers.append(float(w))
-            i += 1
+            numbers.append(float(w)); i += 1
         elif w in WORD_NUMS:
-            num_words = []
+            nw = []
             while i < len(words) and words[i].strip('.,?!') in WORD_NUMS:
-                num_words.append(words[i].strip('.,?!'))
-                i += 1
-            numbers.append(words_to_number(num_words))
+                nw.append(words[i].strip('.,?!')); i += 1
+            numbers.append(words_to_number(nw))
         else:
             i += 1
     return numbers
 
 def detect_op(text):
-    ops = {
-        'add': ['accelerat', 'add', 'plus', 'increase', 'gain', 'faster', 'more', 'grows', 'grow', 'climbs', 'rises'],
-        'sub': ['decelerat', 'subtract', 'minus', 'decrease', 'slow', 'less', 'lose', 'loses', 'drop', 'reduc', 'shrink', 'falls'],
-        'mul': ['multipl', 'times', 'double', 'triple'],
-        'div': ['divid', 'split', 'half', 'halv'],
-    }
-    for op, keywords in ops.items():
-        if any(k in text for k in keywords):
-            return op
+    for op, kw in {
+        'add': ['accelerat','add','plus','increase','gain','faster','more','grows','grow','climbs','rises'],
+        'sub': ['decelerat','subtract','minus','decrease','slow','less','lose','loses','drop','reduc','shrink','falls'],
+        'mul': ['multipl','times','double','triple'],
+        'div': ['divid','split','half','halv'],
+    }.items():
+        if any(k in text for k in kw): return op
     return 'add'
 
 def solve_challenge(challenge):
     cleaned = clean_challenge(challenge)
     numbers = extract_numbers(cleaned)
-    
     if len(numbers) < 2:
-        raw = re.findall(r'\d+\.?\d*', challenge)
-        numbers = [float(n) for n in raw]
-    
-    if len(numbers) < 2:
-        return None
-    
+        numbers = [float(n) for n in re.findall(r'\d+\.?\d*', challenge)]
+    if len(numbers) < 2: return None
     op = detect_op(cleaned)
     a, b = numbers[0], numbers[1]
-    
-    if op == 'add':    result = a + b
-    elif op == 'sub':  result = a - b
-    elif op == 'mul':  result = a * b
-    elif op == 'div':  result = a / b if b else 0
-    else:              result = a + b
-    
-    return f"{result:.2f}"
+    r = {'add': a+b, 'sub': a-b, 'mul': a*b, 'div': a/b if b else 0}.get(op, a+b)
+    return f"{r:.2f}"
 
 # ─── Commands ───
 
 def cmd_register(args):
-    """Register a new agent on Moltbook."""
-    name = args.name
-    desc = args.desc or f"AI agent {name}"
-    
+    name, desc = args.name, args.desc or f"AI agent {name}"
     log(f"Registering agent: {name}")
     data = api_post("agents/register", {"name": name, "description": desc})
-    
     if not data.get("success"):
-        error = data.get("error", "unknown")
-        hint = data.get("hint", "")
-        log(f"❌ Registration failed: {error} {hint}")
+        log(f"❌ Failed: {data.get('error','')} {data.get('hint','')}")
         return
-    
     agent = data["agent"]
-    tweet_template = data.get("tweet_template", "")
-    
     config = {
-        "api_key": agent["api_key"],
-        "agent_name": agent["name"],
-        "agent_id": agent["id"],
-        "claim_url": agent["claim_url"],
+        "api_key": agent["api_key"], "agent_name": agent["name"],
+        "agent_id": agent["id"], "claim_url": agent["claim_url"],
         "verification_code": agent["verification_code"],
         "profile_url": agent["profile_url"],
-        "tweet_template": tweet_template,
+        "tweet_template": data.get("tweet_template", ""),
         "registered_at": agent["created_at"],
     }
     save_config(config)
-    
-    print()
-    print("=" * 60)
+    print(f"\n{'='*60}")
     print(f"✅ Agent registered: {agent['name']}")
-    print("=" * 60)
-    print(f"API Key:    {agent['api_key']}")
-    print(f"Profile:    {agent['profile_url']}")
-    print()
-    print("📋 Next step — auto-claim:")
-    print(f"  python3 {sys.argv[0]} claim --auth-token YOUR_TWITTER_AUTH_TOKEN")
-    print()
-    print("Or manual claim:")
-    print(f"  1. Open: {agent['claim_url']}")
-    print(f"  2. Tweet: {tweet_template}")
-    print("=" * 60)
+    print(f"{'='*60}")
+    print(f"API Key: {agent['api_key']}")
+    print(f"\n📋 Next: python3 {sys.argv[0]} claim --auth-token YOUR_TOKEN")
+    print(f"{'='*60}")
 
 def cmd_claim(args):
-    """Auto-claim: post verification tweet + open claim URL."""
     config = load_config()
     if not config:
-        log("❌ No config found. Run 'register' first.")
-        return
+        log("❌ No config. Run 'register' first."); return
     
     auth_token = args.auth_token
+    api_key = config["api_key"]
     tweet_text = config.get("tweet_template", "")
     claim_url = config.get("claim_url", "")
-    api_key = config.get("api_key", "")
     
-    if not tweet_text:
-        log("❌ No tweet template in config. Re-run 'register'.")
-        return
+    # Check if already claimed
+    if api_get("agents/status", api_key).get("status") == "claimed":
+        log("✅ Already claimed!"); return
     
-    # Step 1: Check if already claimed
-    status_data = api_get("agents/status", api_key)
-    if status_data.get("status") == "claimed":
-        log("✅ Already claimed! Skip to: python3 mbc20-bot.py mint --loop")
-        return
+    # Step 1: Create Twitter session
+    log("Setting up Twitter session...")
+    session, ct0 = twitter_session(auth_token)
+    if not ct0:
+        log("❌ Failed to get Twitter CSRF token. Check auth_token."); return
+    log("  ✅ Twitter session ready")
     
     # Step 2: Post verification tweet
-    log("Step 1/3: Posting verification tweet...")
-    ok, result = post_tweet(auth_token, tweet_text)
+    log("Posting verification tweet...")
+    ok, result = post_tweet(session, ct0, tweet_text)
     if not ok:
-        log(f"❌ Tweet failed: {result}")
-        log("Try manually: post the tweet and open the claim URL")
-        log(f"  Tweet: {tweet_text}")
-        log(f"  Claim: {claim_url}")
+        log(f"❌ Tweet failed: {result}"); return
+    log(f"  ✅ Tweet posted: https://x.com/i/status/{result}")
+    
+    # Step 3: Get OAuth URL from Moltbook claim page
+    log("Getting OAuth URL from claim page...")
+    
+    # The claim page's "Connect with X" button triggers an OAuth flow
+    # We need to find the OAuth initiation URL
+    # It's typically: /api/auth/twitter or similar
+    
+    # Try common Moltbook OAuth endpoints
+    oauth_init_urls = [
+        f"https://www.moltbook.com/api/auth/twitter?claim_token={claim_url.split('/')[-1]}",
+        f"https://www.moltbook.com/api/v1/auth/twitter/claim?token={claim_url.split('/')[-1]}",
+        f"https://www.moltbook.com/api/auth/callback/twitter",
+    ]
+    
+    # First, try to get the OAuth URL by visiting the claim page
+    try:
+        claim_resp = session.get(claim_url, timeout=15)
+        # Look for OAuth URL in the page source
+        oauth_match = re.search(r'(https://api\.(?:twitter|x)\.com/oauth/authorize\?oauth_token=[^"\'&\s]+)', claim_resp.text)
+        if oauth_match:
+            oauth_url = oauth_match.group(1)
+            log(f"  Found OAuth URL in page")
+        else:
+            # Try the Next.js API route pattern
+            # The "Connect with X" button likely calls a Next.js API route
+            claim_token = claim_url.split("/")[-1]
+            
+            # Try fetching the OAuth init endpoint
+            oauth_url = None
+            for init_url in [
+                f"https://www.moltbook.com/api/auth/twitter?claim={claim_token}",
+                f"https://www.moltbook.com/api/auth/twitter/authorize?claim={claim_token}",
+                f"https://www.moltbook.com/api/v1/claim/{claim_token}/auth",
+            ]:
+                try:
+                    r = requests.get(init_url, timeout=10, allow_redirects=False)
+                    if r.status_code in (301, 302, 303, 307):
+                        loc = r.headers.get("Location", "")
+                        if "oauth" in loc or "twitter" in loc or "x.com" in loc:
+                            oauth_url = loc
+                            log(f"  Found OAuth redirect: {init_url}")
+                            break
+                    elif r.status_code == 200:
+                        data = r.json() if 'json' in r.headers.get('content-type','') else {}
+                        if 'url' in data:
+                            oauth_url = data['url']
+                            break
+                except:
+                    continue
+            
+            if not oauth_url:
+                log("❌ Could not find OAuth URL automatically.")
+                log("   The claim page uses client-side JavaScript to initiate OAuth.")
+                log("   You need to open the claim URL in a browser and click 'Connect with X':")
+                log(f"   {claim_url}")
+                log("   (Tweet is already posted, just need to click Connect with X)")
+                return
+    except Exception as e:
+        log(f"❌ Failed to access claim page: {e}"); return
+    
+    # Step 4: Authorize via OAuth
+    log("Authorizing via Twitter OAuth...")
+    ok, callback = twitter_oauth_authorize(session, ct0, oauth_url)
+    if not ok:
+        log(f"❌ OAuth failed: {callback}")
+        log(f"   Open manually: {claim_url}")
         return
     
-    # Step 3: Open claim URL (trigger verification)
-    log("Step 2/3: Triggering claim verification...")
-    log(f"  Claim URL: {claim_url}")
+    # Step 5: Follow callback to Moltbook
+    log("Completing claim...")
+    try:
+        final_resp = session.get(callback, timeout=15, allow_redirects=True)
+        log(f"  Callback status: {final_resp.status_code}")
+    except Exception as e:
+        log(f"  Callback request: {e}")
     
-    # The claim URL needs to be visited by the human in browser
-    # But we can try hitting it via the API to see if auto-verification works
-    # Moltbook checks Twitter for the verification tweet
-    
-    # Step 4: Poll for claim status
-    log("Step 3/3: Waiting for Moltbook to verify...")
-    log("  ⚠️  You may need to open the claim URL in your browser:")
-    log(f"  {claim_url}")
-    
-    for i in range(30):  # Wait up to 5 minutes
-        time.sleep(10)
-        status_data = api_get("agents/status", api_key)
-        status = status_data.get("status", "unknown")
-        
+    # Step 6: Verify claim
+    time.sleep(3)
+    for i in range(10):
+        status = api_get("agents/status", api_key).get("status")
         if status == "claimed":
             log("✅ Agent claimed successfully!")
-            log(f"  Start minting: python3 {sys.argv[0]} mint --loop")
+            log(f"   Start minting: python3 {sys.argv[0]} mint --loop")
             return
-        
-        if i % 3 == 0:
-            log(f"  Still pending... ({i*10}s)")
+        time.sleep(3)
     
-    log("⏳ Claim not confirmed yet. The tweet is posted.")
-    log("  Open the claim URL in your browser to complete:")
-    log(f"  {claim_url}")
+    log("⏳ Claim not confirmed yet. Tweet is posted, OAuth attempted.")
+    log(f"   Try opening manually: {claim_url}")
 
 def cmd_status(args):
-    """Check agent claim status."""
     config = load_config()
     if not config:
-        log("❌ No config found. Run 'register' first.")
-        return
-    
+        log("❌ No config. Run 'register' first."); return
     data = api_get("agents/status", config["api_key"])
     status = data.get("status", "unknown")
-    
     if status == "claimed":
-        print(f"✅ Agent '{config['agent_name']}' is claimed and active!")
-        print(f"   Ready to mint: python3 {sys.argv[0]} mint --loop")
+        print(f"✅ Agent '{config['agent_name']}' is active! Run: python3 {sys.argv[0]} mint --loop")
     elif status == "pending_claim":
-        print(f"⏳ Agent '{config['agent_name']}' is pending claim.")
-        print(f"   Claim: python3 {sys.argv[0]} claim --auth-token YOUR_TOKEN")
-        print(f"   Or manual: {config.get('claim_url', 'N/A')}")
+        print(f"⏳ Pending. Claim: python3 {sys.argv[0]} claim --auth-token TOKEN")
     else:
-        error = data.get("error", "")
-        hint = data.get("hint", "")
-        print(f"❓ Status: {status} {error} {hint}")
+        print(f"❓ {status} {data.get('error','')} {data.get('hint','')}")
 
 def cmd_mint(args):
-    """Mint tokens."""
     config = load_config()
     if not config:
-        log("❌ No config found. Run 'register' first.")
-        return
-    
-    api_key = config["api_key"]
-    tick = args.tick
-    amt = args.amt
-    interval = args.interval
-    
+        log("❌ No config. Run 'register' first."); return
+    api_key, tick, amt, interval = config["api_key"], args.tick, args.amt, args.interval
     if args.loop:
-        log(f"🔄 Auto-mint loop: {amt} {tick} every {interval}s")
-        mint_count = 0
-        fail_count = 0
+        log(f"🔄 Loop: {amt} {tick} every {interval}s")
+        count, fails = 0, 0
         while True:
-            ok = do_mint(api_key, tick, amt)
-            if ok:
-                mint_count += 1
-                fail_count = 0
-                log(f"📊 Total mints: {mint_count} | Next in {interval}s...")
+            if do_mint(api_key, tick, amt):
+                count += 1; fails = 0
+                log(f"📊 Total: {count} | Next in {interval}s...")
             else:
-                fail_count += 1
-                wait = min(interval, 300 * fail_count)
-                log(f"⏳ Fail #{fail_count}, retry in {wait}s...")
-                time.sleep(wait)
-                continue
+                fails += 1
+                wait = min(interval, 300 * fails)
+                log(f"⏳ Fail #{fails}, retry in {wait}s...")
+                time.sleep(wait); continue
             time.sleep(interval)
     else:
         do_mint(api_key, tick, amt)
 
 def do_mint(api_key, tick, amt):
-    """Execute one mint."""
     log(f"⛏️  Minting {amt} {tick}...")
-    
     flair = f"t{int(time.time())}-{random.randint(100,999)}"
     inscription = json.dumps({"p": "mbc-20", "op": "mint", "tick": tick, "amt": amt})
-    content = f"{inscription}\n\nmbc20.xyz\n\n{flair}"
-    
     data = api_post("posts", {
         "submolt": "general",
         "title": f"Minting {tick} | {flair}",
-        "content": content
+        "content": f"{inscription}\n\nmbc20.xyz\n\n{flair}"
     }, api_key)
-    
     if not data.get("success"):
-        error = data.get("error", data.get("message", "unknown"))
-        hint = data.get("hint", "")
-        log(f"  ❌ Post failed: {error} {hint}")
-        return False
-    
+        log(f"  ❌ {data.get('error','')} {data.get('hint','')}"); return False
     post_id = data.get("post", {}).get("id", "?")
-    verification = data.get("verification", {})
-    code = verification.get("code")
-    challenge = verification.get("challenge")
-    
-    if not code or not challenge:
-        log(f"  ✅ Minted (no verification): {post_id}")
-        return True
-    
-    log(f"  🧩 Challenge: {challenge[:80]}...")
+    v = data.get("verification", {})
+    code, challenge = v.get("code"), v.get("challenge")
+    if not code: log(f"  ✅ Minted (no verify): {post_id}"); return True
     answer = solve_challenge(challenge)
-    if not answer:
-        log(f"  ❌ Could not solve challenge")
-        return False
-    log(f"  💡 Answer: {answer}")
-    
-    vdata = api_post("verify", {
-        "verification_code": code,
-        "answer": answer
-    }, api_key)
-    
-    if vdata.get("success"):
-        log(f"  ✅ Minted {amt} {tick}!")
-        return True
-    else:
-        error = vdata.get("error", vdata.get("message", "unknown"))
-        log(f"  ❌ Verification failed: {error}")
-        return False
+    if not answer: log("  ❌ Can't solve challenge"); return False
+    log(f"  💡 {answer}")
+    vd = api_post("verify", {"verification_code": code, "answer": answer}, api_key)
+    if vd.get("success"): log(f"  ✅ Minted {amt} {tick}!"); return True
+    log(f"  ❌ Verify failed: {vd.get('error','')}"); return False
 
 # ─── Main ───
 
 def main():
-    parser = argparse.ArgumentParser(description="MBC-20 Complete Mint Bot")
-    sub = parser.add_subparsers(dest="command")
+    p = argparse.ArgumentParser(description="MBC-20 Mint Bot")
+    sub = p.add_subparsers(dest="cmd")
     
-    # register
-    p_reg = sub.add_parser("register", help="Register a new agent")
-    p_reg.add_argument("--name", required=True, help="Agent name")
-    p_reg.add_argument("--desc", default=None, help="Agent description")
+    r = sub.add_parser("register", help="Register agent")
+    r.add_argument("--name", required=True)
+    r.add_argument("--desc", default=None)
     
-    # claim
-    p_claim = sub.add_parser("claim", help="Auto-claim via Twitter")
-    p_claim.add_argument("--auth-token", required=True, help="Twitter auth_token cookie")
+    c = sub.add_parser("claim", help="Auto-claim via Twitter")
+    c.add_argument("--auth-token", required=True, help="Twitter auth_token cookie")
     
-    # status
-    sub.add_parser("status", help="Check claim status")
+    sub.add_parser("status", help="Check status")
     
-    # mint
-    p_mint = sub.add_parser("mint", help="Mint tokens")
-    p_mint.add_argument("--tick", default="CLAW", help="Token ticker (default: CLAW)")
-    p_mint.add_argument("--amt", default="1000", help="Amount (default: 1000)")
-    p_mint.add_argument("--loop", action="store_true", help="Run continuously")
-    p_mint.add_argument("--interval", type=int, default=7200, help="Seconds between mints (default: 7200)")
+    m = sub.add_parser("mint", help="Mint tokens")
+    m.add_argument("--tick", default="CLAW")
+    m.add_argument("--amt", default="1000")
+    m.add_argument("--loop", action="store_true")
+    m.add_argument("--interval", type=int, default=7200)
     
-    args = parser.parse_args()
-    
-    cmds = {
-        "register": cmd_register,
-        "claim": cmd_claim,
-        "status": cmd_status,
-        "mint": cmd_mint,
-    }
-    
-    fn = cmds.get(args.command)
-    if fn:
-        fn(args)
-    else:
-        parser.print_help()
+    args = p.parse_args()
+    {"register": cmd_register, "claim": cmd_claim, "status": cmd_status, "mint": cmd_mint}.get(args.cmd, lambda _: p.print_help())(args)
 
 if __name__ == "__main__":
     main()
