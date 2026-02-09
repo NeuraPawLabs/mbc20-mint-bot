@@ -19,6 +19,7 @@ import time
 import random
 import argparse
 import hashlib
+import string
 import threading
 
 from mbc20.logger import log
@@ -158,6 +159,12 @@ def cmd_mint(args):
 
 # ─── Batch (Multi-Account) Commands ───
 
+def _random_name(length=8):
+    """Generate a random agent name (letters + digits)."""
+    chars = string.ascii_lowercase + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+
 def _account_id(auth_token):
     """Generate a stable account ID from auth_token."""
     return hashlib.sha256(auth_token.encode()).hexdigest()[:12]
@@ -182,7 +189,7 @@ def cmd_batch_register(args):
         proxy = acc.get("proxy")
         name = f"agent_{aid}"
 
-        log(f"\n[{i+1}/{len(accounts)}] Registering {name} (proxy: {proxy or 'none'})...")
+        log(f"\n[{i+1}/{len(accounts)}] Registering (proxy: {proxy or 'none'})...")
 
         # Check if already registered
         existing = config.load(aid)
@@ -190,9 +197,21 @@ def cmd_batch_register(args):
             log(f"  ⏭️  Already registered: {existing['agent_name']}")
             continue
 
-        data = moltbook.register(name, proxy=proxy)
-        if not data.get("success"):
+        # Try random names until one works
+        for attempt in range(5):
+            name = _random_name()
+            data = moltbook.register(name, proxy=proxy)
+            if data.get("success"):
+                break
+            if "already taken" in data.get("error", "").lower():
+                continue  # Name collision, retry
             log(f"  ❌ {data.get('error','')} {data.get('hint','')}")
+            break
+        else:
+            log("  ❌ Failed after 5 name attempts")
+            continue
+
+        if not data.get("success"):
             continue
 
         agent = data["agent"]
