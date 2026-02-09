@@ -1,78 +1,64 @@
-"""Config management — multi-account support."""
+"""Config management — supports global + per-account configs."""
 
 import json
 import os
+import hashlib
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "moltbook"
+CONFIG_FILE = CONFIG_DIR / "credentials.json"
 ACCOUNTS_DIR = CONFIG_DIR / "accounts"
-ACCOUNTS_FILE = CONFIG_DIR / "accounts.txt"
-
-# Legacy single-account
-LEGACY_FILE = CONFIG_DIR / "credentials.json"
 
 
-def load_accounts_file(path=None):
-    """
-    Load accounts from file. Format: auth_token,proxy_url (one per line).
-    Returns list of {"auth_token": ..., "proxy": ...}.
-    """
-    p = Path(path) if path else ACCOUNTS_FILE
-    if not p.exists():
-        return []
-    accounts = []
-    for line in p.read_text().strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(",", 1)
-        auth_token = parts[0].strip()
-        proxy = parts[1].strip() if len(parts) > 1 else None
-        accounts.append({"auth_token": auth_token, "proxy": proxy})
-    return accounts
+def load():
+    """Load global config."""
+    if not CONFIG_FILE.exists():
+        return None
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
 
 
-def account_dir(account_id):
-    """Get config dir for a specific account."""
-    d = ACCOUNTS_DIR / account_id
+def save(data):
+    """Save global config."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def account_dir(auth_token):
+    """Get per-account config directory (by token hash)."""
+    h = hashlib.sha256(auth_token.encode()).hexdigest()[:12]
+    d = ACCOUNTS_DIR / h
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def load(account_id=None):
-    """Load config for an account. Falls back to legacy single-account."""
-    if account_id:
-        f = ACCOUNTS_DIR / account_id / "credentials.json"
-        if f.exists():
-            with open(f) as fh:
-                return json.load(fh)
+def load_account(auth_token):
+    """Load per-account config."""
+    cfg_file = account_dir(auth_token) / "config.json"
+    if not cfg_file.exists():
         return None
-    # Legacy
-    if LEGACY_FILE.exists():
-        with open(LEGACY_FILE) as f:
-            return json.load(f)
-    return None
+    with open(cfg_file) as f:
+        return json.load(f)
 
 
-def save(data, account_id=None):
-    """Save config for an account."""
-    if account_id:
-        d = ACCOUNTS_DIR / account_id
-        d.mkdir(parents=True, exist_ok=True)
-        f = d / "credentials.json"
-    else:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        f = LEGACY_FILE
-    with open(f, 'w') as fh:
-        json.dump(data, fh, indent=2)
-    os.chmod(f, 0o600)
+def save_account(auth_token, data):
+    """Save per-account config."""
+    d = account_dir(auth_token)
+    cfg_file = d / "config.json"
+    with open(cfg_file, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(cfg_file, 0o600)
+    return cfg_file
 
 
 def list_accounts():
-    """List all registered account IDs."""
+    """List all saved account configs."""
     if not ACCOUNTS_DIR.exists():
         return []
-    return sorted([
-        d.name for d in ACCOUNTS_DIR.iterdir()
-        if d.is_dir() and (d / "credentials.json").exists()
-    ])
+    configs = []
+    for cfg_file in sorted(ACCOUNTS_DIR.glob("*/config.json")):
+        with open(cfg_file) as f:
+            configs.append(json.load(f))
+    return configs

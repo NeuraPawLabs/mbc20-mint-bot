@@ -1,14 +1,16 @@
-"""Twitter API client using curl_cffi."""
+"""Twitter API client — curl_cffi with proxy support."""
 
 import re
-import time
 from urllib.parse import urlparse, parse_qs
 
 from curl_cffi import requests as curl_requests
 
 from .logger import log
 
-BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+BEARER = (
+    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
+    "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
 CREATE_TWEET_URL = "https://x.com/i/api/graphql/F3SgNCEemikyFA5xnQOmTw/CreateTweet"
 CREATE_TWEET_QUERY_ID = "F3SgNCEemikyFA5xnQOmTw"
 
@@ -61,31 +63,18 @@ def _api_headers(ct0):
         "X-Twitter-Client-Language": "en",
         "Referer": "https://x.com/home",
         "Origin": "https://x.com",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+        ),
         "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Sec-Ch-Ua": '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Linux"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
     }
 
 
 def create_session(auth_token, proxy=None):
-    """Create a Twitter session and return (session, ct0)."""
-    kwargs = {"impersonate": "chrome"}
-    if proxy:
-        kwargs["proxies"] = {"http": proxy, "https": proxy}
-    s = curl_requests.Session(**kwargs)
+    """Create a Twitter session. Returns (session, ct0)."""
+    s = curl_requests.Session(impersonate="chrome", proxy=proxy)
     s.cookies.set("auth_token", auth_token, domain=".x.com")
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
     try:
         s.get("https://x.com/home", timeout=15, allow_redirects=True)
     except:
@@ -108,10 +97,17 @@ def post_tweet(session, ct0, text):
         "queryId": CREATE_TWEET_QUERY_ID,
     }
     try:
-        resp = session.post(CREATE_TWEET_URL, headers=_api_headers(ct0), json=payload, timeout=30)
+        resp = session.post(
+            CREATE_TWEET_URL, headers=_api_headers(ct0), json=payload, timeout=30
+        )
         data = resp.json()
-        tweet_id = (data.get("data", {}).get("create_tweet", {})
-                    .get("tweet_results", {}).get("result", {}).get("rest_id"))
+        tweet_id = (
+            data.get("data", {})
+            .get("create_tweet", {})
+            .get("tweet_results", {})
+            .get("result", {})
+            .get("rest_id")
+        )
         if tweet_id:
             return True, tweet_id
         errors = data.get("errors", [])
@@ -122,181 +118,28 @@ def post_tweet(session, ct0, text):
         return False, str(e)
 
 
-def oauth_authorize(session, ct0, oauth_url):
-    """
-    Automate Twitter OAuth 1.0a authorization.
-    Returns (ok, callback_url_or_error).
-    """
-    log("  Fetching OAuth authorize page...")
-    try:
-        resp = session.get(oauth_url, timeout=15, allow_redirects=True)
-    except Exception as e:
-        return False, f"Failed to load OAuth page: {e}"
-
-    if "/login" in resp.url or "oauth" not in resp.url:
-        return False, f"Redirected to login. URL: {resp.url}"
-
-    html = resp.text
-
-    if "oauth_verifier" in resp.url:
-        return True, resp.url
-
-    auth_match = re.search(r'name="authenticity_token"\s+value="([^"]+)"', html)
-    if not auth_match:
-        return False, "Could not find authenticity_token"
-
-    oauth_match = re.search(r'name="oauth_token"\s+value="([^"]+)"', html)
-    if not oauth_match:
-        oauth_match = re.search(r'oauth_token=([^&"]+)', resp.url)
-    if not oauth_match:
-        return False, "Could not find oauth_token"
-
-    log("  Authorizing app...")
-    try:
-        auth_resp = session.post(
-            "https://api.x.com/oauth/authorize",
-            data={
-                "authenticity_token": auth_match.group(1),
-                "redirect_after_login": resp.url,
-                "oauth_token": oauth_match.group(1),
-            },
-            timeout=15,
-            allow_redirects=False,
-        )
-    except Exception as e:
-        return False, f"OAuth POST failed: {e}"
-
-    if auth_resp.status_code in (301, 302, 303, 307):
-        loc = auth_resp.headers.get("Location", "")
-        if "oauth_verifier" in loc or "moltbook" in loc:
-            return True, loc
-        return False, f"Unexpected redirect: {loc}"
-
-    for pattern in [
-        r'href="([^"]*oauth_verifier[^"]*)"',
-        r'(https?://[^\s"<>]*oauth_verifier=[^\s"<>]*)',
-    ]:
-        m = re.search(pattern, auth_resp.text)
-        if m:
-            return True, m.group(1)
-
-    return False, f"OAuth returned {auth_resp.status_code}, no redirect"
-
-
-def oauth2_authorize(session, ct0, oauth_url):
-    """
-    Automate Twitter OAuth 2.0 authorization.
-    Returns (ok, callback_url_or_error).
-    """
-    log("  Parsing OAuth URL...")
-    try:
-        parsed = urlparse(oauth_url)
-        params = parse_qs(parsed.query)
-
-        client_id = params.get('client_id', [''])[0]
-        code_challenge = params.get('code_challenge', [''])[0]
-        code_challenge_method = params.get('code_challenge_method', [''])[0]
-        redirect_uri = params.get('redirect_uri', [''])[0]
-        response_type = params.get('response_type', [''])[0]
-        scope = params.get('scope', [''])[0]
-        state = params.get('state', [''])[0]
-
-        log(f"  client_id: {client_id[:20]}...")
-        log(f"  redirect_uri: {redirect_uri}")
-
-        api_url = "https://twitter.com/i/api/2/oauth2/authorize"
-        api_params = {
-            'client_id': client_id, 'code_challenge': code_challenge,
-            'code_challenge_method': code_challenge_method,
-            'redirect_uri': redirect_uri, 'response_type': response_type,
-            'scope': scope, 'state': state,
-        }
-
-        headers = _api_headers(ct0)
-
-        auth_token_cookie = (session.cookies.get('auth_token', domain='.x.com')
-                             or session.cookies.get('auth_token', domain='x.com'))
-        ct0_cookie = (session.cookies.get('ct0', domain='.x.com')
-                      or session.cookies.get('ct0', domain='x.com'))
-
-        if not auth_token_cookie or not ct0_cookie:
-            return False, "Missing required cookies"
-
-        headers['cookie'] = f'auth_token={auth_token_cookie}; ct0={ct0_cookie}'
-        headers['referer'] = oauth_url
-
-        log("  Calling Twitter OAuth2 API...")
-        resp = session.get(api_url, params=api_params, headers=headers, timeout=15)
-
-        if resp.status_code != 200:
-            return False, f"API returned {resp.status_code}"
-
-        data = resp.json()
-        auth_code = data.get('auth_code')
-        if not auth_code:
-            return False, f"No auth_code: {data}"
-
-        log(f"  ✅ Got auth_code: {auth_code[:20]}...")
-
-        # Confirm authorization
-        log("  Confirming authorization...")
-        post_headers = headers.copy()
-        post_headers['content-type'] = 'application/x-www-form-urlencoded'
-        post_headers['origin'] = 'https://twitter.com'
-
-        confirm_resp = session.post(
-            api_url, headers=post_headers,
-            data=f'approval=true&code={auth_code}',
-            timeout=15, allow_redirects=False,
-        )
-
-        if confirm_resp.status_code in [302, 303, 307]:
-            loc = confirm_resp.headers.get('Location')
-            if loc:
-                return True, loc
-
-        try:
-            cdata = confirm_resp.json()
-            if 'redirect_uri' in cdata:
-                return True, cdata['redirect_uri']
-            code = cdata.get('code') or cdata.get('auth_code')
-            if code:
-                return True, f"{redirect_uri}?code={code}&state={state}"
-        except:
-            pass
-
-        return False, f"Unexpected confirm response: {confirm_resp.text[:300]}"
-
-    except Exception as e:
-        return False, f"Error: {e}"
-
-
 def get_moltbook_oauth_url(session, claim_url):
-    """
-    Get OAuth URL from Moltbook using NextAuth flow.
-    Returns oauth_url or None.
-    """
+    """Get OAuth URL from Moltbook via NextAuth. Returns url or None."""
     try:
-        log("  Getting CSRF token...")
         session.get(
             "https://www.moltbook.com/api/auth/session",
             headers={"Referer": claim_url, "Accept": "*/*"},
             timeout=10,
         )
 
-        csrf_token = None
         csrf_cookie = session.cookies.get("__Host-authjs.csrf-token")
-        if csrf_cookie:
-            csrf_token = csrf_cookie.split("%7C")[0] if "%7C" in csrf_cookie else csrf_cookie.split("|")[0]
-
-        if not csrf_token:
-            log("  ❌ Could not get CSRF token")
+        if not csrf_cookie:
             return None
 
-        log("  ✅ Got CSRF token")
-        log("  Requesting OAuth URL...")
+        csrf_token = (
+            csrf_cookie.split("%7C")[0]
+            if "%7C" in csrf_cookie
+            else csrf_cookie.split("|")[0]
+        )
 
-        callback_url = claim_url.replace("https://www.moltbook.com", "")
+        callback_url = claim_url.replace(
+            "https://www.moltbook.com", ""
+        ).replace("https://moltbook.com", "")
         if "?" not in callback_url:
             callback_url += "?x_connected=true"
 
@@ -317,20 +160,118 @@ def get_moltbook_oauth_url(session, claim_url):
         if resp.status_code in (301, 302, 303, 307):
             loc = resp.headers.get("Location", "")
             if "twitter.com" in loc or "x.com" in loc:
-                log("  ✅ Got OAuth URL")
                 return loc
 
         try:
             data = resp.json()
-            if "url" in data and ("twitter.com" in data["url"] or "x.com" in data["url"]):
-                log("  ✅ Got OAuth URL from JSON")
+            if "url" in data and (
+                "twitter.com" in data["url"] or "x.com" in data["url"]
+            ):
                 return data["url"]
         except:
             pass
 
-        log(f"  ❌ Unexpected response: {resp.status_code}")
+        return None
+    except:
         return None
 
+
+def oauth2_authorize(session, ct0, oauth_url):
+    """
+    Twitter OAuth 2.0 authorization.
+    Returns (ok, callback_url_or_error).
+    """
+    try:
+        parsed = urlparse(oauth_url)
+        params = parse_qs(parsed.query)
+
+        api_params = {
+            k: params[k][0]
+            for k in [
+                "client_id", "code_challenge", "code_challenge_method",
+                "redirect_uri", "response_type", "scope", "state",
+            ]
+            if k in params
+        }
+
+        redirect_uri = api_params.get("redirect_uri", "")
+        state = api_params.get("state", "")
+
+        headers = _api_headers(ct0)
+        auth_token_cookie = session.cookies.get("auth_token", domain=".x.com")
+        ct0_cookie = session.cookies.get("ct0", domain=".x.com")
+        if not auth_token_cookie or not ct0_cookie:
+            return False, "Missing cookies"
+
+        headers["cookie"] = f"auth_token={auth_token_cookie}; ct0={ct0_cookie}"
+        headers["referer"] = oauth_url
+
+        # Step 1: GET to obtain auth_code
+        resp = session.get(
+            "https://twitter.com/i/api/2/oauth2/authorize",
+            params=api_params,
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return False, f"API returned {resp.status_code}: {resp.text[:200]}"
+
+        data = resp.json()
+        auth_code = data.get("auth_code")
+        if not auth_code:
+            return False, f"No auth_code: {data}"
+
+        # Step 2: POST to confirm (must use JSON, not form-urlencoded!)
+        post_headers = headers.copy()
+        post_headers["content-type"] = "application/json"
+        post_headers["origin"] = "https://twitter.com"
+
+        confirm_resp = session.post(
+            "https://twitter.com/i/api/2/oauth2/authorize",
+            headers=post_headers,
+            json={"approval": True, "code": auth_code},
+            timeout=15,
+            allow_redirects=False,
+        )
+
+        # Extract callback URL
+        if confirm_resp.status_code in [302, 303, 307]:
+            loc = confirm_resp.headers.get("Location")
+            if loc:
+                return True, loc
+
+        try:
+            cdata = confirm_resp.json()
+            if "redirect_uri" in cdata:
+                return True, cdata["redirect_uri"]
+            code = cdata.get("code") or cdata.get("auth_code")
+            if code:
+                return True, f"{redirect_uri}?code={code}&state={state}"
+        except:
+            pass
+
+        return False, f"Confirm failed: {confirm_resp.status_code}"
     except Exception as e:
-        log(f"  ❌ Error: {e}")
-        return None
+        return False, str(e)
+
+
+def verify_tweet_with_session(session, claim_url, claim_token):
+    """
+    Call Moltbook verify-tweet using the current session cookies.
+    Must be called after OAuth callback so session has Moltbook auth.
+    Returns response dict.
+    """
+    try:
+        resp = session.post(
+            "https://www.moltbook.com/api/v1/agents/verify-tweet",
+            headers={
+                "Content-Type": "application/json",
+                "Referer": claim_url,
+                "Origin": "https://www.moltbook.com",
+            },
+            json={"token": claim_token},
+            timeout=15,
+        )
+        return resp.json()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
