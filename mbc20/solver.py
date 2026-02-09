@@ -1,4 +1,12 @@
-"""Verification challenge solver — handles heavy obfuscation."""
+"""Verification challenge solver — handles Moltbook's obfuscation.
+
+Moltbook obfuscation patterns:
+  1. Mixed case: tHiRtY → thirty
+  2. Extra letters inserted: tHiRrTy → thirty (extra 'r')
+  3. Words split by spaces: tHiRrT y → thirty
+  4. Special chars injected: A] LoOoObSstT-eR's → A Lobster's
+  5. Multiple patterns combined
+"""
 
 import re
 
@@ -15,157 +23,104 @@ WORD_NUMS = {
 }
 
 OP_KEYWORDS = {
+    "mul": ["product", "multipl", "times", "double", "triple"],
+    "div": ["divid", "split", "half", "halv", "quarter", "ratio"],
     "sub": [
         "decelerat", "subtract", "minus", "decrease", "slow",
         "loses", "lose", "drop", "reduc", "shrink", "falls",
-        "fell", "lower", "less", "behind",
+        "fell", "lower", "behind", "less",
     ],
-    "mul": ["multipl", "times", "double", "triple", "product"],
-    "div": ["divid", "split", "half", "halv", "quarter", "ratio"],
     "add": [
         "accelerat", "add", "plus", "increase", "gain",
         "faster", "more", "grows", "grow", "climbs", "climb",
-        "rises", "rise", "ahead", "boost", "extra", "additional",
-        "total", "sum", "combined",
+        "rises", "rise", "ahead", "boost", "extra", "sum", "total",
     ],
 }
 
 
-def _deobfuscate_word(word):
-    """
-    Remove duplicate/inserted letters from an obfuscated word.
-    e.g. 'tHiRrTy' → 'thirty', 'LoOoObSstTeR' → 'lobster'
-
-    Strategy: collapse consecutive duplicate letters, then try fuzzy match.
-    """
-    w = word.lower()
-    # Step 1: collapse runs of same letter (e.g., 'ooo' → 'o', 'ss' → 's', 'tt' → 't')
-    collapsed = re.sub(r"(.)\1+", r"\1", w)
-    return collapsed
-
-
 def _clean(text):
-    """Remove obfuscation from challenge text."""
-    # Replace hyphens between letters with space
-    text = re.sub(r"(?<=[a-zA-Z])-(?=[a-zA-Z])", " ", text)
-    # Remove non-alphanumeric except spaces and dots
+    """Basic clean: lowercase, remove special chars."""
     text = re.sub(r"[^a-zA-Z0-9 .]", " ", text)
-    # Collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip().lower()
+    text = re.sub(r"\s+", " ", text).lower().strip()
+    return text
 
-    # Deobfuscate: collapse duplicate letters in each word
-    words = [re.sub(r"(.)\1+", r"\1", w) for w in text.split()]
 
-    # Merge fragmented tokens: try joining adjacent words to form number words
-    merged = []
-    i = 0
-    while i < len(words):
+def _deobfuscate(text):
+    """
+    Advanced deobfuscation:
+    1. Remove all non-alpha chars
+    2. Collapse consecutive duplicate letters
+    Returns a single string with no spaces.
+    """
+    # Keep only letters
+    alpha = re.sub(r"[^a-z]", "", text.lower())
+    # Collapse consecutive duplicates: 'thhiirrrttyy' → 'thirty'
+    result = []
+    for ch in alpha:
+        if not result or result[-1] != ch:
+            result.append(ch)
+    return "".join(result)
+
+
+def _find_numbers_in_blob(blob):
+    """
+    Find number words in a deobfuscated blob string.
+    Returns list of floats. Does NOT combine compound numbers
+    since word boundaries are lost in the blob.
+    """
+    numbers = []
+    # Sort by length descending to match longer words first
+    # (e.g., "thirteen" before "three", "eighteen" before "eight")
+    sorted_words = sorted(WORD_NUMS.keys(), key=len, reverse=True)
+
+    remaining = blob
+    while remaining:
         found = False
-        # Try merging up to 3 adjacent tokens
-        for span in range(3, 0, -1):
-            if i + span <= len(words):
-                combo = "".join(words[i : i + span])
-                # Also try with collapsed duplicates
-                combo_collapsed = re.sub(r"(.)\1+", r"\1", combo)
-                if combo_collapsed in WORD_NUMS or combo in WORD_NUMS:
-                    merged.append(combo_collapsed if combo_collapsed in WORD_NUMS else combo)
-                    i += span
-                    found = True
-                    break
+        for word in sorted_words:
+            if remaining.startswith(word):
+                val = WORD_NUMS[word]
+                # Skip "hundred"/"thousand" as standalone (they're multipliers)
+                if val < 100:
+                    numbers.append(float(val))
+                remaining = remaining[len(word):]
+                found = True
+                break
         if not found:
-            merged.append(words[i])
-            i += 1
+            remaining = remaining[1:]  # skip one char
 
-    return " ".join(merged)
-
-
-def _fuzzy_match_number(word):
-    """Try to fuzzy-match a word to a number word."""
-    if word in WORD_NUMS:
-        return word
-
-    # Try with collapsed duplicates
-    collapsed = re.sub(r"(.)\1+", r"\1", word)
-    if collapsed in WORD_NUMS:
-        return collapsed
-
-    # Try matching against known number words with edit distance
-    for num_word in WORD_NUMS:
-        # Check if the collapsed word contains the number word as subsequence
-        if _is_subsequence(num_word, word):
-            return num_word
-
-    return None
+    return numbers
 
 
-def _is_subsequence(short, long):
-    """Check if 'short' is a subsequence of 'long'."""
-    it = iter(long)
-    return all(c in it for c in short)
-
-
-def _extract_numbers(text):
-    """Extract all numbers (digit or word form) from cleaned text."""
+def _extract_numbers_standard(text):
+    """Extract numbers from cleaned text (standard method)."""
     numbers = []
     words = text.split()
     i = 0
     while i < len(words):
         w = words[i].strip(".,?!")
-
-        # Try digit
         if re.match(r"^\d+\.?\d*$", w):
             numbers.append(float(w))
             i += 1
-            continue
-
-        # Try exact match
-        if w in WORD_NUMS:
+        elif w in WORD_NUMS:
             nw = []
             while i < len(words) and words[i].strip(".,?!") in WORD_NUMS:
                 nw.append(words[i].strip(".,?!"))
                 i += 1
-            numbers.append(float(_words_to_number(nw)))
-            continue
-
-        # Try fuzzy match
-        matched = _fuzzy_match_number(w)
-        if matched:
-            nw = [matched]
-            i += 1
-            while i < len(words):
-                next_w = words[i].strip(".,?!")
-                next_match = _fuzzy_match_number(next_w) or (next_w if next_w in WORD_NUMS else None)
-                if next_match:
-                    nw.append(next_match)
-                    i += 1
+            current = 0
+            for ww in nw:
+                val = WORD_NUMS[ww]
+                if val >= 100:
+                    current = (current or 1) * val
                 else:
-                    break
-            numbers.append(float(_words_to_number(nw)))
-            continue
-
-        i += 1
-
+                    current += val
+            numbers.append(float(current))
+        else:
+            i += 1
     return numbers
 
 
-def _words_to_number(words):
-    """Convert word-form number to int."""
-    if not words:
-        return 0
-    current = 0
-    for w in words:
-        if w not in WORD_NUMS:
-            break
-        val = WORD_NUMS[w]
-        if val >= 100:
-            current = (current or 1) * val
-        else:
-            current += val
-    return current
-
-
 def _detect_op(text):
-    """Detect math operation from cleaned text."""
+    """Detect math operation. Check mul/div first (more specific)."""
     for op in ["mul", "div", "sub", "add"]:
         for keyword in OP_KEYWORDS[op]:
             if keyword in text:
@@ -179,20 +134,39 @@ def solve(challenge, debug=True):
     Returns answer as 'X.XX' string, or None if unsolvable.
     """
     cleaned = _clean(challenge)
-    numbers = _extract_numbers(cleaned)
 
-    # Fallback: extract raw digits from original
+    # Method 1: Standard extraction from cleaned text
+    numbers = _extract_numbers_standard(cleaned)
+
+    # Method 2: If not enough numbers, try deobfuscation
+    if len(numbers) < 2:
+        blob = _deobfuscate(challenge)
+        numbers = [float(n) for n in _find_numbers_in_blob(blob)]
+        if debug and numbers:
+            log(f"  🔍 Deobfuscated numbers: {numbers}")
+
+    # Method 3: Fallback to raw digit extraction
     if len(numbers) < 2:
         numbers = [float(n) for n in re.findall(r"\d+\.?\d*", challenge)]
 
     if len(numbers) < 2:
         if debug:
-            log(f"  ⚠️ Solver: only {len(numbers)} numbers in: {cleaned[:80]}")
+            log(f"  ⚠️ Solver: only {len(numbers)} numbers found")
+            log(f"  ⚠️ Cleaned: {cleaned[:100]}")
+            blob = _deobfuscate(challenge)
+            log(f"  ⚠️ Blob: {blob[:100]}")
         return None
 
+    # Detect operation from both cleaned and deobfuscated text
+    blob = _deobfuscate(challenge)
     op = _detect_op(cleaned)
-    a, b = numbers[0], numbers[1]
+    if op == "add":
+        # Double-check with blob (deobfuscated might reveal "product" etc.)
+        op2 = _detect_op(blob)
+        if op2 != "add":
+            op = op2
 
+    a, b = numbers[0], numbers[1]
     result = {
         "add": a + b,
         "sub": a - b,
@@ -201,6 +175,6 @@ def solve(challenge, debug=True):
     }.get(op, a + b)
 
     if debug:
-        log(f"  🧮 [{a} {op} {b} = {result}] {cleaned[:60]}...")
+        log(f"  🧮 [{a} {op} {b} = {result}]")
 
     return f"{result:.2f}"
