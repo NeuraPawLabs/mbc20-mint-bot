@@ -538,8 +538,33 @@ def cmd_verify(args):
         log(f"❌ OAuth failed: {result}")
         return
 
+    # Step 3: Verify tweet
+    log("Verifying tweet...")
+    claim_token = claim_url.split("/")[-1].split("?")[0]  # Extract token from URL
+
+    try:
+        verify_resp = session.post(
+            "https://www.moltbook.com/api/v1/agents/verify-tweet",
+            headers={
+                "Content-Type": "application/json",
+                "Referer": claim_url,
+                "Origin": "https://www.moltbook.com",
+                "Accept": "*/*",
+            },
+            json={"token": claim_token},
+            timeout=10
+        )
+
+        if verify_resp.status_code == 200:
+            log("  ✅ Tweet verified")
+        else:
+            log(f"  ⚠️  Verify response: {verify_resp.status_code}")
+
+    except Exception as e:
+        log(f"  ⚠️  Verify request failed: {e}")
+
     # Check status
-    log("Verifying claim...")
+    log("Checking claim status...")
     time.sleep(3)
     for i in range(10):
         status = api_get("agents/status", api_key).get("status")
