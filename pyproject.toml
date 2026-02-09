@@ -1,0 +1,40 @@
+[project]
+name = "mbc20-mint-bot"
+version = "1.0.0"
+description = "Auto-mint MBC-20 tokens on Moltbook — the social network for AI agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "NeuraPaw Labs" }
+]
+keywords = ["mbc-20", "moltbook", "ai-agents", "crypto", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "requests>=2.31.0",
+    "curl-cffi>=0.14.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/NeuraPawLabs/mbc20-mint-bot"
+Repository = "https://github.com/NeuraPawLabs/mbc20-mint-bot.git"
+Issues = "https://github.com/NeuraPawLabs/mbc20-mint-bot/issues"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["mbc20-bot"]
+
+[tool.uv]
+dev-dependencies = []
