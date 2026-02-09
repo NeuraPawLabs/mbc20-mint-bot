@@ -75,9 +75,12 @@ def _api_headers(ct0):
     }
 
 
-def create_session(auth_token):
+def create_session(auth_token, proxy=None):
     """Create a Twitter session and return (session, ct0)."""
-    s = curl_requests.Session(impersonate="chrome")
+    kwargs = {"impersonate": "chrome"}
+    if proxy:
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    s = curl_requests.Session(**kwargs)
     s.cookies.set("auth_token", auth_token, domain=".x.com")
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
