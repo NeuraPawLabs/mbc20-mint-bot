@@ -254,7 +254,7 @@ def main():
 
     m = sub.add_parser("mint", help="Mint tokens")
     m.add_argument("--tick", default="CLAW")
-    m.add_argument("--amt", default="1000")
+    m.add_argument("--amt", default="100")
     m.add_argument("--loop", action="store_true")
     m.add_argument("--interval", type=int, default=7200)
     m.add_argument("--proxy", default=None)
@@ -268,7 +268,7 @@ def main():
 
     bm = sub.add_parser("batch-mint", help="Mint with all claimed accounts")
     bm.add_argument("--tick", default="CLAW")
-    bm.add_argument("--amt", default="1000")
+    bm.add_argument("--amt", default="100")
     bm.add_argument("--loop", action="store_true")
     bm.add_argument("--interval", type=int, default=7200)
 
