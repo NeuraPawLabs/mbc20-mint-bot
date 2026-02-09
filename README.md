@@ -11,17 +11,17 @@ git clone https://github.com/NeuraPawLabs/mbc20-mint-bot.git
 cd mbc20-mint-bot
 pip install requests
 
-# 1. Register
-python3 mbc20-bot.py register --name "YourAgent" --desc "My agent"
-
-# 2. Claim: open the claim URL, post the verification tweet
-
-# 3. Check status
-python3 mbc20-bot.py status
-
-# 4. Start minting
+# Full automation (one command per step):
+python3 mbc20-bot.py register --name "YourAgent"
+python3 mbc20-bot.py claim --auth-token "YOUR_TWITTER_AUTH_TOKEN"
 python3 mbc20-bot.py mint --loop
 ```
+
+## Getting Your Twitter auth_token
+
+1. Open Twitter/X in Chrome
+2. Press F12 → Application → Cookies → `https://x.com`
+3. Find `auth_token` → copy the value
 
 ## Commands
 
@@ -29,18 +29,21 @@ python3 mbc20-bot.py mint --loop
 ```bash
 python3 mbc20-bot.py register --name "AgentName" --desc "Description"
 ```
-Registers a new agent on Moltbook. Saves API key to `~/.config/moltbook/credentials.json`.
+Registers a new agent on Moltbook. Saves API key automatically.
 
-After registering:
-1. Open the claim URL printed in output
-2. Post the verification tweet from your Twitter account
-3. Done — your agent is activated
+### Claim (Full Auto)
+```bash
+python3 mbc20-bot.py claim --auth-token "your_auth_token_here"
+```
+Automatically:
+1. Posts verification tweet using your auth_token
+2. Completes Twitter OAuth authorization
+3. Activates the agent on Moltbook
 
 ### Status
 ```bash
 python3 mbc20-bot.py status
 ```
-Check if your agent has been claimed/verified.
 
 ### Mint
 ```bash
@@ -67,12 +70,10 @@ nohup python3 mbc20-bot.py mint --loop > mbc20.log 2>&1 &
 
 ## How It Works
 
-1. Posts a mint inscription on Moltbook
-2. Solves the verification challenge (obfuscated math problem)
-3. Submits the answer to publish the post
-4. MBC-20 indexer picks up the inscription and credits tokens
-
-Each post includes a random identifier to avoid duplicate content detection.
+1. **Register**: Creates agent on Moltbook, saves API key
+2. **Claim**: Posts verification tweet + completes OAuth flow
+3. **Mint**: Posts inscription → solves verification challenge → publishes
+4. **Loop**: Repeats minting every 2 hours with random identifiers
 
 ## Available Tokens
 
@@ -81,14 +82,18 @@ Check [mbc20.xyz](https://mbc20.xyz) for the full list. Main token:
 
 ## Claiming on Base
 
-After minting, you can claim tokens as ERC-20 on Base:
-1. Link your wallet: post `{"p":"mbc-20","op":"link","wallet":"0xYourAddress"}` from your agent
+After minting, claim tokens as ERC-20 on Base:
+1. Link wallet: post `{"p":"mbc-20","op":"link","wallet":"0xYourAddress"}` from your agent
 2. Go to [mbc20.xyz/trade](https://mbc20.xyz/trade) and claim
 
 ## Rate Limits
 
-- Moltbook posting: ~1 post per 2 hours per agent
+- ~1 post per 2 hours per agent
 - For higher throughput: register multiple agents with different Twitter accounts
+
+## Config
+
+Credentials saved to `~/.config/moltbook/credentials.json` (chmod 600).
 
 ## License
 
