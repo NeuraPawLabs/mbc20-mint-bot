@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 """
 MBC-20 Complete Mint Bot
-From registration to auto-minting, all in one script.
+Full automation: register → tweet verify → claim → auto-mint
 
 Usage:
-  # Step 1: Register a new agent
-  python3 mbc20-bot.py register --name MyAgent --desc "My cool agent"
-  
-  # Step 2: After claiming via Twitter, check status
+  python3 mbc20-bot.py register --name MyAgent
+  python3 mbc20-bot.py claim --auth-token "YOUR_TWITTER_AUTH_TOKEN"
   python3 mbc20-bot.py status
-  
-  # Step 3: Single mint
-  python3 mbc20-bot.py mint
-  
-  # Step 4: Auto-mint loop
   python3 mbc20-bot.py mint --loop
 
-Config saved to: ~/.config/moltbook/credentials.json
+Config: ~/.config/moltbook/credentials.json
 """
 
 import requests
@@ -33,6 +26,11 @@ from pathlib import Path
 BASE_URL = "https://www.moltbook.com/api/v1"
 CONFIG_DIR = Path.home() / ".config" / "moltbook"
 CONFIG_FILE = CONFIG_DIR / "credentials.json"
+
+# ─── Twitter Constants ───
+
+TWITTER_BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+TWITTER_CREATE_TWEET_URL = "https://x.com/i/api/graphql/mnCM2YNMkpMB5bYEbGGKRQ/CreateTweet"
 
 # ─── Word-to-Number ───
 
@@ -85,6 +83,110 @@ def api_get(path, api_key):
         return resp.json()
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+# ─── Twitter API ───
+
+def get_twitter_ct0(auth_token):
+    """Get ct0 CSRF token from Twitter using auth_token cookie."""
+    session = requests.Session()
+    session.cookies.set("auth_token", auth_token, domain=".x.com")
+    
+    try:
+        resp = session.get("https://x.com/home", timeout=15, allow_redirects=True)
+        ct0 = session.cookies.get("ct0", domain=".x.com")
+        if ct0:
+            return ct0, session
+        
+        # Try extracting from response
+        for cookie in session.cookies:
+            if cookie.name == "ct0":
+                return cookie.value, session
+    except Exception as e:
+        log(f"  Failed to get ct0: {e}")
+    
+    return None, session
+
+def post_tweet(auth_token, text):
+    """Post a tweet using Twitter auth_token."""
+    log(f"  Posting tweet...")
+    
+    ct0, session = get_twitter_ct0(auth_token)
+    if not ct0:
+        return False, "Failed to get CSRF token (ct0). Check your auth_token."
+    
+    headers = {
+        "Authorization": f"Bearer {TWITTER_BEARER}",
+        "Content-Type": "application/json",
+        "X-Csrf-Token": ct0,
+        "X-Twitter-Auth-Type": "OAuth2Session",
+        "X-Twitter-Active-User": "yes",
+        "X-Twitter-Client-Language": "en",
+        "Referer": "https://x.com/compose/tweet",
+        "Origin": "https://x.com",
+    }
+    
+    payload = {
+        "variables": {
+            "tweet_text": text,
+            "dark_request": False,
+            "media": {"media_entities": [], "possibly_sensitive": False},
+            "semantic_annotation_ids": [],
+        },
+        "features": {
+            "communities_web_enable_tweet_community_results_fetch": True,
+            "c9s_tweet_anatomy_moderator_badge_enabled": True,
+            "tweetypie_unmention_optimization_enabled": True,
+            "responsive_web_edit_tweet_api_enabled": True,
+            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+            "view_counts_everywhere_api_enabled": True,
+            "longform_notetweets_consumption_enabled": True,
+            "responsive_web_twitter_article_tweet_consumption_enabled": True,
+            "tweet_awards_web_tipping_enabled": False,
+            "creator_subscriptions_quote_tweet_preview_enabled": False,
+            "longform_notetweets_rich_text_read_enabled": True,
+            "longform_notetweets_inline_media_enabled": True,
+            "articles_preview_enabled": True,
+            "rweb_video_timestamps_enabled": True,
+            "rweb_tipjar_consumption_enabled": True,
+            "responsive_web_graphql_exclude_directive_enabled": True,
+            "verified_phone_label_enabled": False,
+            "freedom_of_speech_not_reach_fetch_enabled": True,
+            "standardized_nudges_misinfo": True,
+            "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+            "responsive_web_graphql_timeline_navigation_enabled": True,
+            "responsive_web_enhance_cards_enabled": False,
+        },
+        "queryId": "mnCM2YNMkpMB5bYEbGGKRQ",
+    }
+    
+    session.cookies.set("ct0", ct0, domain=".x.com")
+    
+    try:
+        resp = session.post(
+            TWITTER_CREATE_TWEET_URL,
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        data = resp.json()
+        
+        tweet_result = data.get("data", {}).get("create_tweet", {}).get("tweet_results", {}).get("result", {})
+        tweet_id = tweet_result.get("rest_id")
+        
+        if tweet_id:
+            log(f"  ✅ Tweet posted: https://x.com/i/status/{tweet_id}")
+            return True, tweet_id
+        
+        # Check for errors
+        errors = data.get("errors", [])
+        if errors:
+            return False, errors[0].get("message", str(errors))
+        
+        return False, f"Unexpected response: {json.dumps(data)[:200]}"
+        
+    except Exception as e:
+        return False, str(e)
 
 # ─── Challenge Solver ───
 
@@ -175,6 +277,8 @@ def cmd_register(args):
         return
     
     agent = data["agent"]
+    tweet_template = data.get("tweet_template", "")
+    
     config = {
         "api_key": agent["api_key"],
         "agent_name": agent["name"],
@@ -182,30 +286,87 @@ def cmd_register(args):
         "claim_url": agent["claim_url"],
         "verification_code": agent["verification_code"],
         "profile_url": agent["profile_url"],
+        "tweet_template": tweet_template,
         "registered_at": agent["created_at"],
     }
     save_config(config)
     
-    tweet = data.get("tweet_template", "")
-    
     print()
     print("=" * 60)
     print(f"✅ Agent registered: {agent['name']}")
-    print(f"=" * 60)
+    print("=" * 60)
     print(f"API Key:    {agent['api_key']}")
     print(f"Profile:    {agent['profile_url']}")
     print()
-    print("📋 Next steps:")
-    print(f"  1. Open claim URL:")
-    print(f"     {agent['claim_url']}")
+    print("📋 Next step — auto-claim:")
+    print(f"  python3 {sys.argv[0]} claim --auth-token YOUR_TWITTER_AUTH_TOKEN")
     print()
-    print(f"  2. Post this tweet:")
-    print(f"     {tweet}")
-    print()
-    print(f"  3. After claiming, run:")
-    print(f"     python3 {sys.argv[0]} status")
-    print(f"     python3 {sys.argv[0]} mint --loop")
+    print("Or manual claim:")
+    print(f"  1. Open: {agent['claim_url']}")
+    print(f"  2. Tweet: {tweet_template}")
     print("=" * 60)
+
+def cmd_claim(args):
+    """Auto-claim: post verification tweet + open claim URL."""
+    config = load_config()
+    if not config:
+        log("❌ No config found. Run 'register' first.")
+        return
+    
+    auth_token = args.auth_token
+    tweet_text = config.get("tweet_template", "")
+    claim_url = config.get("claim_url", "")
+    api_key = config.get("api_key", "")
+    
+    if not tweet_text:
+        log("❌ No tweet template in config. Re-run 'register'.")
+        return
+    
+    # Step 1: Check if already claimed
+    status_data = api_get("agents/status", api_key)
+    if status_data.get("status") == "claimed":
+        log("✅ Already claimed! Skip to: python3 mbc20-bot.py mint --loop")
+        return
+    
+    # Step 2: Post verification tweet
+    log("Step 1/3: Posting verification tweet...")
+    ok, result = post_tweet(auth_token, tweet_text)
+    if not ok:
+        log(f"❌ Tweet failed: {result}")
+        log("Try manually: post the tweet and open the claim URL")
+        log(f"  Tweet: {tweet_text}")
+        log(f"  Claim: {claim_url}")
+        return
+    
+    # Step 3: Open claim URL (trigger verification)
+    log("Step 2/3: Triggering claim verification...")
+    log(f"  Claim URL: {claim_url}")
+    
+    # The claim URL needs to be visited by the human in browser
+    # But we can try hitting it via the API to see if auto-verification works
+    # Moltbook checks Twitter for the verification tweet
+    
+    # Step 4: Poll for claim status
+    log("Step 3/3: Waiting for Moltbook to verify...")
+    log("  ⚠️  You may need to open the claim URL in your browser:")
+    log(f"  {claim_url}")
+    
+    for i in range(30):  # Wait up to 5 minutes
+        time.sleep(10)
+        status_data = api_get("agents/status", api_key)
+        status = status_data.get("status", "unknown")
+        
+        if status == "claimed":
+            log("✅ Agent claimed successfully!")
+            log(f"  Start minting: python3 {sys.argv[0]} mint --loop")
+            return
+        
+        if i % 3 == 0:
+            log(f"  Still pending... ({i*10}s)")
+    
+    log("⏳ Claim not confirmed yet. The tweet is posted.")
+    log("  Open the claim URL in your browser to complete:")
+    log(f"  {claim_url}")
 
 def cmd_status(args):
     """Check agent claim status."""
@@ -219,10 +380,11 @@ def cmd_status(args):
     
     if status == "claimed":
         print(f"✅ Agent '{config['agent_name']}' is claimed and active!")
-        print(f"   Ready to mint. Run: python3 {sys.argv[0]} mint --loop")
+        print(f"   Ready to mint: python3 {sys.argv[0]} mint --loop")
     elif status == "pending_claim":
         print(f"⏳ Agent '{config['agent_name']}' is pending claim.")
-        print(f"   Claim URL: {config.get('claim_url', 'N/A')}")
+        print(f"   Claim: python3 {sys.argv[0]} claim --auth-token YOUR_TOKEN")
+        print(f"   Or manual: {config.get('claim_url', 'N/A')}")
     else:
         error = data.get("error", "")
         hint = data.get("hint", "")
@@ -252,7 +414,7 @@ def cmd_mint(args):
                 log(f"📊 Total mints: {mint_count} | Next in {interval}s...")
             else:
                 fail_count += 1
-                wait = min(interval, 300 * fail_count)  # backoff on failures
+                wait = min(interval, 300 * fail_count)
                 log(f"⏳ Fail #{fail_count}, retry in {wait}s...")
                 time.sleep(wait)
                 continue
@@ -264,11 +426,10 @@ def do_mint(api_key, tick, amt):
     """Execute one mint."""
     log(f"⛏️  Minting {amt} {tick}...")
     
-    flair = f"npaw-{int(time.time())}-{random.randint(100,999)}"
+    flair = f"t{int(time.time())}-{random.randint(100,999)}"
     inscription = json.dumps({"p": "mbc-20", "op": "mint", "tick": tick, "amt": amt})
     content = f"{inscription}\n\nmbc20.xyz\n\n{flair}"
     
-    # Post
     data = api_post("posts", {
         "submolt": "general",
         "title": f"Minting {tick} | {flair}",
@@ -287,10 +448,9 @@ def do_mint(api_key, tick, amt):
     challenge = verification.get("challenge")
     
     if not code or not challenge:
-        log(f"  ✅ Minted (no verification needed): {post_id}")
+        log(f"  ✅ Minted (no verification): {post_id}")
         return True
     
-    # Solve
     log(f"  🧩 Challenge: {challenge[:80]}...")
     answer = solve_challenge(challenge)
     if not answer:
@@ -298,7 +458,6 @@ def do_mint(api_key, tick, amt):
         return False
     log(f"  💡 Answer: {answer}")
     
-    # Verify
     vdata = api_post("verify", {
         "verification_code": code,
         "answer": answer
@@ -323,6 +482,10 @@ def main():
     p_reg.add_argument("--name", required=True, help="Agent name")
     p_reg.add_argument("--desc", default=None, help="Agent description")
     
+    # claim
+    p_claim = sub.add_parser("claim", help="Auto-claim via Twitter")
+    p_claim.add_argument("--auth-token", required=True, help="Twitter auth_token cookie")
+    
     # status
     sub.add_parser("status", help="Check claim status")
     
@@ -335,12 +498,16 @@ def main():
     
     args = parser.parse_args()
     
-    if args.command == "register":
-        cmd_register(args)
-    elif args.command == "status":
-        cmd_status(args)
-    elif args.command == "mint":
-        cmd_mint(args)
+    cmds = {
+        "register": cmd_register,
+        "claim": cmd_claim,
+        "status": cmd_status,
+        "mint": cmd_mint,
+    }
+    
+    fn = cmds.get(args.command)
+    if fn:
+        fn(args)
     else:
         parser.print_help()
 
