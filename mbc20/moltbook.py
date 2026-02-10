@@ -63,7 +63,7 @@ def create_mint_post(api_key, tick, amt, flair, proxy=None):
         {
             "submolt": "general",
             "title": f"Minting {tick} | {flair}",
-            "content": f"{inscription}\n\nmbc20.xyz\n\n{flair}",
+            "content": f"{inscription}\n\nmbc20.xyz",
         },
         api_key,
         proxy=proxy,

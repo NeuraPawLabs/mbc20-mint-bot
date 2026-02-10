@@ -1,16 +1,85 @@
-"""Verification challenge solver — handles Moltbook's obfuscation.
+"""Verification challenge solver — uses Claude Haiku LLM with regex fallback.
 
-Moltbook obfuscation patterns:
-  1. Mixed case: tHiRtY → thirty
-  2. Extra letters inserted: tHiRrTy → thirty (extra 'r')
-  3. Words split by spaces: tHiRrT y → thirty
-  4. Special chars injected: A] LoOoObSstT-eR's → A Lobster's
-  5. Multiple patterns combined
+Primary: Claude Haiku via Anthropic Messages API (fast, accurate)
+Fallback: Regex-based solver for when LLM is unavailable
 """
 
+import os
 import re
+import json
+
+import requests
 
 from .logger import log
+
+# ─── LLM Config ───
+
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://cc-gateway.gtapp.xyz/api")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-haiku-4-5-20251001")
+LLM_TIMEOUT = 15
+
+SYSTEM_PROMPT = """You are a math puzzle solver. You will receive an obfuscated text that contains a math problem.
+
+The text may have:
+- Mixed case letters (tHiRtY = thirty)
+- Extra letters inserted (tHiRrTy = thirty)
+- Words split by spaces or special characters
+- Numbers written as words (twenty-three = 23)
+
+Your job:
+1. Decode the obfuscated text to find the actual math problem
+2. Identify the two numbers and the operation (add/subtract/multiply/divide)
+3. Calculate the answer
+4. Reply with ONLY the numeric answer rounded to 2 decimal places (e.g. "42.00")
+
+Do NOT include any explanation. Just the number."""
+
+
+def _solve_llm(challenge):
+    """Solve using Claude Haiku. Returns 'X.XX' string or None."""
+    if not LLM_API_KEY:
+        return None
+
+    try:
+        url = f"{LLM_BASE_URL}/v1/messages"
+        headers = {
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": LLM_MODEL,
+            "max_tokens": 64,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": challenge}],
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=LLM_TIMEOUT)
+        if r.status_code != 200:
+            log(f"  ⚠️ LLM error: {r.status_code} {r.text[:100]}")
+            return None
+
+        data = r.json()
+        text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text += block["text"]
+
+        text = text.strip()
+        # Extract number from response
+        match = re.search(r"-?\d+\.?\d*", text)
+        if match:
+            num = float(match.group())
+            return f"{num:.2f}"
+        log(f"  ⚠️ LLM response not a number: {text[:50]}")
+        return None
+
+    except Exception as e:
+        log(f"  ⚠️ LLM exception: {e}")
+        return None
+
+
+# ─── Regex Fallback ───
 
 WORD_NUMS = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
@@ -39,60 +108,53 @@ OP_KEYWORDS = {
 
 
 def _clean(text):
-    """Basic clean: lowercase, remove special chars."""
     text = re.sub(r"[^a-zA-Z0-9 .]", " ", text)
     text = re.sub(r"\s+", " ", text).lower().strip()
     return text
 
 
 def _deobfuscate(text):
-    """
-    Advanced deobfuscation:
-    1. Remove all non-alpha chars
-    2. Collapse consecutive duplicate letters
-    Returns a single string with no spaces.
-    """
-    # Keep only letters
     alpha = re.sub(r"[^a-z]", "", text.lower())
-    # Collapse consecutive duplicates: 'thhiirrrttyy' → 'thirty'
-    result = []
+    collapsed = []
     for ch in alpha:
-        if not result or result[-1] != ch:
-            result.append(ch)
-    return "".join(result)
+        if not collapsed or collapsed[-1] != ch:
+            collapsed.append(ch)
+    return alpha, "".join(collapsed)
 
 
 def _find_numbers_in_blob(blob):
-    """
-    Find number words in a deobfuscated blob string.
-    Returns list of floats. Does NOT combine compound numbers
-    since word boundaries are lost in the blob.
-    """
-    numbers = []
-    # Sort by length descending to match longer words first
-    # (e.g., "thirteen" before "three", "eighteen" before "eight")
+    entries = []
     sorted_words = sorted(WORD_NUMS.keys(), key=len, reverse=True)
-
-    remaining = blob
-    while remaining:
+    pos = 0
+    while pos < len(blob):
         found = False
         for word in sorted_words:
-            if remaining.startswith(word):
+            if blob[pos:].startswith(word):
                 val = WORD_NUMS[word]
-                # Skip "hundred"/"thousand" as standalone (they're multipliers)
                 if val < 100:
-                    numbers.append(float(val))
-                remaining = remaining[len(word):]
+                    entries.append((val, pos, pos + len(word)))
+                pos += len(word)
                 found = True
                 break
         if not found:
-            remaining = remaining[1:]  # skip one char
+            pos += 1
 
+    numbers = []
+    i = 0
+    while i < len(entries):
+        val, start, end = entries[i]
+        if val in (20, 30, 40, 50, 60, 70, 80, 90) and i + 1 < len(entries):
+            next_val, next_start, next_end = entries[i + 1]
+            if 1 <= next_val <= 9 and next_start == end:
+                numbers.append(float(val + next_val))
+                i += 2
+                continue
+        numbers.append(float(val))
+        i += 1
     return numbers
 
 
 def _extract_numbers_standard(text):
-    """Extract numbers from cleaned text (standard method)."""
     numbers = []
     words = text.split()
     i = 0
@@ -120,7 +182,6 @@ def _extract_numbers_standard(text):
 
 
 def _detect_op(text):
-    """Detect math operation. Check mul/div first (more specific)."""
     for op in ["mul", "div", "sub", "add"]:
         for keyword in OP_KEYWORDS[op]:
             if keyword in text:
@@ -128,53 +189,65 @@ def _detect_op(text):
     return "add"
 
 
-def solve(challenge, debug=True):
-    """
-    Solve an obfuscated math challenge.
-    Returns answer as 'X.XX' string, or None if unsolvable.
-    """
+def _solve_regex(challenge, debug=True):
+    """Regex-based fallback solver."""
     cleaned = _clean(challenge)
+    raw_blob, collapsed_blob = _deobfuscate(challenge)
 
-    # Method 1: Standard extraction from cleaned text
-    numbers = _extract_numbers_standard(cleaned)
+    std_nums = _extract_numbers_standard(cleaned)
+    raw_nums = _find_numbers_in_blob(raw_blob)
+    col_nums = _find_numbers_in_blob(collapsed_blob)
+    blob_nums = raw_nums if len(raw_nums) >= len(col_nums) else col_nums
 
-    # Method 2: If not enough numbers, try deobfuscation
-    if len(numbers) < 2:
-        blob = _deobfuscate(challenge)
-        numbers = [float(n) for n in _find_numbers_in_blob(blob)]
-        if debug and numbers:
-            log(f"  🔍 Deobfuscated numbers: {numbers}")
-
-    # Method 3: Fallback to raw digit extraction
-    if len(numbers) < 2:
+    if len(blob_nums) >= 2:
+        numbers = blob_nums
+    elif len(std_nums) >= 2:
+        numbers = std_nums
+    else:
         numbers = [float(n) for n in re.findall(r"\d+\.?\d*", challenge)]
 
     if len(numbers) < 2:
         if debug:
-            log(f"  ⚠️ Solver: only {len(numbers)} numbers found")
-            log(f"  ⚠️ Cleaned: {cleaned[:100]}")
-            blob = _deobfuscate(challenge)
-            log(f"  ⚠️ Blob: {blob[:100]}")
+            log(f"  ⚠️ Regex solver: only {len(numbers)} numbers found")
         return None
 
-    # Detect operation from both cleaned and deobfuscated text
-    blob = _deobfuscate(challenge)
     op = _detect_op(cleaned)
     if op == "add":
-        # Double-check with blob (deobfuscated might reveal "product" etc.)
-        op2 = _detect_op(blob)
-        if op2 != "add":
-            op = op2
+        op = _detect_op(raw_blob)
+    if op == "add":
+        op = _detect_op(collapsed_blob)
 
     a, b = numbers[0], numbers[1]
     result = {
-        "add": a + b,
-        "sub": a - b,
-        "mul": a * b,
-        "div": a / b if b else 0,
+        "add": a + b, "sub": a - b,
+        "mul": a * b, "div": a / b if b else 0,
     }.get(op, a + b)
 
     if debug:
-        log(f"  🧮 [{a} {op} {b} = {result}]")
-
+        log(f"  🧮 Regex: [{a} {op} {b} = {result}]")
     return f"{result:.2f}"
+
+
+# ─── Public API ───
+
+def solve(challenge, debug=True):
+    """
+    Solve an obfuscated math challenge.
+    Primary: Claude Haiku LLM
+    Fallback: Regex-based solver
+    Returns answer as 'X.XX' string, or None if unsolvable.
+    """
+    if debug:
+        log(f"  🔒 Challenge: {challenge[:80]}...")
+
+    # Try LLM first
+    answer = _solve_llm(challenge)
+    if answer:
+        if debug:
+            log(f"  🤖 LLM answer: {answer}")
+        return answer
+
+    # Fallback to regex
+    if debug:
+        log(f"  ⚠️ LLM unavailable, using regex fallback")
+    return _solve_regex(challenge, debug=debug)
